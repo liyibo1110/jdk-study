@@ -5,8 +5,12 @@ import java.security.PrivilegedAction;
 import java.security.PrivilegedExceptionAction;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Callable;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -23,7 +27,70 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class Executors {
 
-    /* 以上即为各种线程池的工厂方法了，下面的都学完了 */
+    /**
+     * 该线程池复用固定数量的线程，从共享的无界队列中获取任务，在任意时刻，最多有nThreads个线程处于活动状态处理任务。
+     * 若所有线程均在处理任务时，提交了新任务，则新任务将在队列中等待直至有线程可用。
+     * 若在关闭前有线程因执行失败而终止，系统将根据后续任务执行需求，自动调用新线程代替。
+     * 该线程池中的线程将持续存在，直到被显式关闭。
+     */
+    public static ExecutorService newFixedThreadPool(int nThreads) {
+        return new ThreadPoolExecutor(nThreads, nThreads,
+                0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
+    }
+
+    public static ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory) {
+        return new ThreadPoolExecutor(nThreads, nThreads,
+                0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), threadFactory);
+    }
+
+    /**
+     * 创建一个使用单个worker线程处理无界队列的executor（注意如果该单线程在关闭前因执行失败而终止，后续任务执行时将根据需要由新线程接替）。
+     * 任务保证按顺序执行，且任何时刻最多只有一个任务处于活动状态。
+     * 与功能等效的newFixedThreadPool(1)不同，返回的executor保证不可通过重新配置来增加线程数量。
+     */
+    public static ExecutorService newSingleThreadExecutor() {
+        return new FinalizableDelegatedExecutorService(
+                new ThreadPoolExecutor(1, 1,
+                        0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>()));
+    }
+
+    public static ExecutorService newSingleThreadExecutor(ThreadFactory threadFactory) {
+        return new FinalizableDelegatedExecutorService(
+                new ThreadPoolExecutor(1, 1,
+                        0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(), threadFactory));
+    }
+
+    /**
+     * 该线程池在需要时创建新线程，但当先前构建的线程可用时会重复使用它们。
+     * 此类线程池通常能提升执行大量短暂异步任务的程序性能，执行调用将复用先前构建的可用线程，若无可用线程，则创建新线程并加入池中。
+     * 闲置超过60秒的线程将被终止并从缓存移除，因此长期处于空闲状态的线程池不会消耗任何资源。
+     * 注意：可通过ThreadPoolExecutor构造方法创建具有相似特性但细节不同的线程池（例如超时参数设置）
+     */
+    public static ExecutorService newCachedThreadPool() {
+        return new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+                60L, TimeUnit.SECONDS, new SynchronousQueue<>());
+    }
+
+    public static ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
+        return new ThreadPoolExecutor(0, Integer.MAX_VALUE,
+                60L, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), threadFactory);
+    }
+
+    public static ScheduledExecutorService newSingleThreadScheduledExecutor() {
+        return new DelegatedScheduledExecutorService(new ScheduledThreadPoolExecutor(1));
+    }
+
+    public static ScheduledExecutorService newSingleThreadScheduledExecutor(ThreadFactory threadFactory) {
+        return new DelegatedScheduledExecutorService(new ScheduledThreadPoolExecutor(1, threadFactory));
+    }
+
+    public static ScheduledExecutorService newScheduledThreadPool(int corePoolSize) {
+        return new ScheduledThreadPoolExecutor(corePoolSize);
+    }
+
+    public static ScheduledExecutorService newScheduledThreadPool(int corePoolSize, ThreadFactory threadFactory) {
+        return new ScheduledThreadPoolExecutor(corePoolSize, threadFactory);
+    }
 
     public static ExecutorService unconfigurableExecutorService(ExecutorService executor) {
         if(executor == null)
