@@ -26,6 +26,90 @@ public abstract class InputStream implements Closeable {
     public InputStream() {}
 
     /**
+     * 返回新的InputStream实现，该流不读取任何字节，返回的流初始状态为打开，通过调用close关闭流，后续调用close将无效。
+     * 在流处于打开状态时，available()、read()、read(byte[])、read(byte[], int, int)、readAllBytes()、readNBytes(byte[], int, int)、readNBytes(int)、skip(long)、skipNBytes(long)和transferTo()方法的行为均视为已到达流尾。
+     * 流关闭后，这些方法均会抛出IOException。
+     * markSupported()方法返回false，mark()方法不执行任何操作，reset()方法将抛出IOException异常。
+     */
+    public static InputStream nullInputStream() {
+        return new InputStream() {
+            private volatile boolean closed;
+
+            private void ensureOpen() throws IOException {
+                if(closed)
+                    throw new IOException("Stream closed");
+            }
+
+            @Override
+            public int available() throws IOException {
+                ensureOpen();
+                return 0;
+            }
+
+            @Override
+            public int read() throws IOException {
+                ensureOpen();
+                return -1;
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                Objects.checkFromIndexSize(off, len, b.length);
+                if(len == 0)
+                    return 0;
+                ensureOpen();
+                return -1;
+            }
+
+            @Override
+            public byte[] readAllBytes() throws IOException {
+                ensureOpen();
+                return new byte[0];
+            }
+
+            @Override
+            public int readNBytes(byte[] b, int off, int len) throws IOException {
+                Objects.checkFromIndexSize(off, len, b.length);
+                ensureOpen();
+                return 0;
+            }
+
+            @Override
+            public byte[] readNBytes(int len) throws IOException {
+                if(len < 0)
+                    throw new IllegalArgumentException("len < 0");
+                ensureOpen();
+                return new byte[0];
+            }
+
+            @Override
+            public long skip(long n) throws IOException {
+                ensureOpen();
+                return 0L;
+            }
+
+            @Override
+            public void skipNBytes(long n) throws IOException {
+                ensureOpen();
+                if(n > 0)
+                    throw new EOFException();
+            }
+
+            @Override
+            public long transferTo(OutputStream out) throws IOException {
+                Objects.requireNonNull(out);
+                ensureOpen();
+                return 0L;
+            }
+
+            @Override
+            public void close() throws IOException {
+                closed = true;
+            }
+        };
+    }
+
+    /**
      * 从输入流中读取下一个字节数据，返回值为字节值，作为0到255范围内的整数，若因到达流尾而无可用字节，则返回-1。
      * 该方法将阻塞直到满足以下任一条件：
      * 1、输入数据可用。
