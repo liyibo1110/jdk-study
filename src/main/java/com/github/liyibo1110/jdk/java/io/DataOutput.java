@@ -5,6 +5,8 @@ import java.io.IOException;
 /**
  * DataOutput接口用于将任何Java基本数据类型转换为字节序列，并将这些字节写入二进制流。
  * 该接口还提供将字符串转换为修改后的UTF-8格式，并写入生成的字节序列的功能。
+ *
+ * JDK的早期I/O接口
  * @author liyibo
  * @date 2026-02-27 19:11
  */

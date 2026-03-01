@@ -11,6 +11,8 @@ import java.io.IOException;
  *
  * Modified UTF-8
  * 内容略
+ *
+ * JDK的早期I/O接口
  * @author liyibo
  * @date 2026-02-26 21:44
  */

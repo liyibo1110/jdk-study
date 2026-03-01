@@ -190,7 +190,7 @@ public class BufferedReader extends Reader {
     /**
      * 读取一行文本（不含换行符），行结束标志包括换行符\n，回车符\r，回车符后紧跟换行符，或达到文件末尾EOF。
      * @param ignoreLF 下一次如果看到\n就跳过（常见于处理\r\n时）
-     * @param term 这一行是否遇到了行终止符（\n或\r），true代表这一行是被换行符截断的，false代表这一行是EOF阶段的（文件末尾没有换行符）
+     * @param term 这一行是否遇到了行终止符（\n或\r），true代表这一行是被换行符截断的，false代表这一行是EOF截断的（文件末尾没有换行符）
      */
     String readLine(boolean ignoreLF, boolean[] term) throws IOException {
         StringBuilder sb = null;    // 一行跨越了多个buffer读取才会使用
