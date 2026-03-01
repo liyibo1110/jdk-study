@@ -25,6 +25,10 @@ public class FileInputStream extends InputStream {
     private final Object closeLock = new Object();
     private volatile boolean closed;
 
+    public FileInputStream(String name) throws FileNotFoundException {
+        this(name != null ? new File(name) : null);
+    }
+
     public FileInputStream(File file) throws FileNotFoundException {
         String name = file != null ? file.getPath() : null;
         if(name == null)
