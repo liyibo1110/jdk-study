@@ -1060,9 +1060,14 @@ public class ArrayList<E> extends AbstractList<E>
     }
 
     final class ArrayListSpliterator implements Spliterator<E> {
-        private int index; // current index, modified on advance/split
-        private int fence; // -1 until used; then one past last index
-        private int expectedModCount; // initialized when fence set
+        /** 当前游标，即下一次要消费的位置 */
+        private int index;
+
+        /** 右边界（开区间），-1表示还没有绑定 */
+        private int fence;
+
+        /** 绑定时刻的modCount快照 */
+        private int expectedModCount;
 
         /** Creates new spliterator covering the given range. */
         ArrayListSpliterator(int origin, int fence, int expectedModCount) {
@@ -1071,8 +1076,12 @@ public class ArrayList<E> extends AbstractList<E>
             this.expectedModCount = expectedModCount;
         }
 
-        private int getFence() { // initialize fence to size on first use
-            int hi; // (a specialized variant appears in method forEach)
+        /**
+         * 第一次使用时才绑定fence，即设成当时的size并返回
+         * 目的是Spliterator创建后，如果List还在变化，在真正开始遍历/拆分之前，这些变化会体现在fence/size上。
+         */
+        private int getFence() {
+            int hi;
             if ((hi = fence) < 0) {
                 expectedModCount = modCount;
                 hi = fence = size;
@@ -1081,19 +1090,28 @@ public class ArrayList<E> extends AbstractList<E>
         }
 
         public ArrayListSpliterator trySplit() {
-            int hi = getFence(), lo = index, mid = (lo + hi) >>> 1;
-            return (lo >= mid) ? null : // divide range in half unless too small
-                    new ArrayListSpliterator(lo, index = mid, expectedModCount);
+            int hi = getFence();    // 确定右边界
+            int lo = index;         // 确定左边界
+            int mid = (lo + hi) >>> 1;  // 取中点
+            // 如果区间长度太小了，返回null，否则返回前半段（注意这里index改成了mid）
+            return lo >= mid ? null : new ArrayListSpliterator(lo, index = mid, expectedModCount);
         }
 
         public boolean tryAdvance(Consumer<? super E> action) {
-            if (action == null)
+            if(action == null)
                 throw new NullPointerException();
-            int hi = getFence(), i = index;
+            int hi = getFence();
+            int i = index;
             if (i < hi) {
-                index = i + 1;
-                @SuppressWarnings("unchecked") E e = (E)elementData[i];
-                action.accept(e);
+                index = i + 1;  // 先推进index
+                E e = (E)elementData[i];    // 再直接读取元素
+                action.accept(e);   // 最后再消费
+
+                /**
+                 * 每次消费完都要检查modCount，注意这里是动作后检查，因为action可能很复杂。
+                 * 这意味着你可能已经对某些元素执行了action，然后才发现了并发修改并抛异常，
+                 * 这在Stream/forEach的语义里是允许的。
+                 */
                 if (modCount != expectedModCount)
                     throw new ConcurrentModificationException();
                 return true;
@@ -1101,24 +1119,29 @@ public class ArrayList<E> extends AbstractList<E>
             return false;
         }
 
+        /**
+         * 优化度非常高的批量遍历
+         */
         public void forEachRemaining(Consumer<? super E> action) {
-            int i, hi, mc; // hoist accesses and checks from loop
+            int i;
+            int hi;
+            int mc;
             Object[] a;
-            if (action == null)
+            if(action == null)
                 throw new NullPointerException();
-            if ((a = elementData) != null) {
-                if ((hi = fence) < 0) {
+            if((a = elementData) != null) { // 意义是：局部变量访问比访问字段快，JIT更容易优化
+                // fence如果还没初始化，不是调用getFence，而是在这里进行特殊的初始化，目的是减少写字段，因为方法会一次性消费到底
+                if((hi = fence) < 0) {
                     mc = modCount;
                     hi = size;
-                }
-                else
+                }else
                     mc = expectedModCount;
-                if ((i = index) >= 0 && (index = hi) <= a.length) {
-                    for (; i < hi; ++i) {
-                        @SuppressWarnings("unchecked") E e = (E) a[i];
+                if((i = index) >= 0 && (index = hi) <= a.length) {
+                    for(; i < hi; ++i) {
+                        E e = (E)a[i];
                         action.accept(e);
                     }
-                    if (modCount == mc)
+                    if(modCount == mc)
                         return;
                 }
             }
