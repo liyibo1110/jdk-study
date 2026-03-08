@@ -1,6 +1,5 @@
 package com.github.liyibo1110.jdk.java.util.concurrent;
 
-import javax.annotation.processing.Completion;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Objects;
@@ -9,11 +8,17 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * 官方冗长的注释不翻译了，核心模型就一句话：Futurn完成时触发依赖任务（Future完成 -> 触发依赖任务 -> 生成新的Future，相当于DAG）
@@ -40,7 +45,22 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
     /** 执行结果，可能是正常值，也可能是异常或者null，最终存的应该是AltResult */
     volatile Object result;
 
-    /** 重要字段：保存这个Completion依赖的任务（又一个Treiber stack） */
+    /**
+     * 重要字段：保存这个Completion依赖的任务（又一个Treiber stack）
+     * 注意这个结构是LIFO（相当于栈），如此设计的原因如下：
+     * 1、在push的时候直接操作头节点即可，无需遍历到尾节点再插入（但这个不是主要优化点）。
+     * 2、在取出Completion时，顺序尽管是反的，因为每个Completion会插件上游src的result是否可用，不可用则返回null，
+     * 因为最终顺序依然会是正确的。
+     * 3、LIFO主要是为了CPU cache优化，刚创建的Completion仍在CPU cache，而LIFO会优先执行新创建的Completion，所以cache hit更高，
+     * 如果是FIFO，则会先执行最老的Completion，在cache中已经被驱逐，Doug Lea在并发库里非常重视cache locality。
+     * 4、例如CompletableFuture.supplyAsync(...).thenApply(...).thenApply(...)，
+     * 在supplyAsync完成时，当前线程已经在CPU上，LIFO可以让最新的stage立即执行，这样pipeline就会在同一个线程继续执行。
+     * 5、LIFO还避免了深递归，如果是FIFO执行可能是f.complete -> Completion1 -> Completion2 -> Completion3，递归深度而可能是pipeline length。
+     * 而现在的LIFO以及相关的NESTED的tryFire调用方式，可能把递归变成了迭代，避免方法暴栈。
+     * 6、因为默认的executor是ForkJoinPool.commonPool，ForkJoinPool核心策略是work-strealing，而ForkJoinPool的任务队列也是LIFO，
+     * 原因同样是：最近创建的任务最可能被当前线程继续执行，所以stack和ForkJoinPool的task queue都是用了LIFO，目的基本是一致的。
+     *
+     */
     volatile Completion stack;
 
     final boolean internalComplete(Object r) {
@@ -61,7 +81,7 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
      */
     final void pushStack(Completion c) {
         do {
-
+            // nothing to do
         } while(!tryPushStack(c));
     }
 
@@ -964,6 +984,9 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         }
     }
 
+    /**
+     * 复制给定的CompletableFuture并返回（anyOf方法会使用）
+     */
     private static <U, T extends U> CompletableFuture<U> uniCopyStage(CompletableFuture<T> src) {
         Object r;
         CompletableFuture<U> d = src.newIncompleteFuture();
@@ -971,6 +994,15 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
             d.result = encodeRelay(r);
         else
             src.unipush(new UniRelay<>(d, src));
+        return d;
+    }
+
+    private MinimalStage<T> uniAsMinimalStage() {
+        Object r;
+        if((r = result) != null)
+            return new MinimalStage<>(encodeRelay(r));
+        MinimalStage<T> d = new MinimalStage<>();
+        unipush(new UniRelay<>(d, this));
         return d;
     }
 
@@ -1265,6 +1297,68 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         return d;
     }
 
+    /**
+     * 只有andTree会使用的BiCompletion特殊子类，tryFire功能就是等待a和b都计算完成即可，不会保存正常返回值（但是有异常则会记录）
+     */
+    static final class BiRelay<T, U> extends BiCompletion<T, U, Void> {
+        BiRelay(CompletableFuture<Void> dep, CompletableFuture<T> src, CompletableFuture<U> snd) {
+            super(null, dep, src, snd);
+        }
+
+        final CompletableFuture<Void> tryFire(int mode) {
+            CompletableFuture<Void> d;
+            CompletableFuture<T> a;
+            CompletableFuture<U> b;
+            Object r, s, z; Throwable x;
+            // a和b都要计算完成
+            if ((a = src) == null || (r = a.result) == null
+                    || (b = snd) == null || (s = b.result) == null
+                    || (d = dep) == null)
+                return null;
+            if(d.result == null) {
+                if ((r instanceof AltResult
+                        && (x = ((AltResult)(z = r)).ex) != null)
+                        || (s instanceof AltResult && (x = ((AltResult)(z = s)).ex) != null))
+                    d.completeThrowable(x, z);
+                else
+                    d.completeNull();
+            }
+            src = null; snd = null; dep = null;
+            return d.postFire(a, b, mode);
+        }
+    }
+
+    /**
+     * 构建and树，此方法会被递归调用
+     */
+    static CompletableFuture<Void> andTree(CompletableFuture<?>[] cfs, int lo, int hi) {
+        CompletableFuture<Void> d = new CompletableFuture<>();  // 创建当前and节点
+        if(lo > hi) // cfs是空的，直接完成
+            d.result = NIL;
+        else {
+            CompletableFuture<?> a, b;
+            Object r, s, z;
+            Throwable x;
+            int mid = (lo + hi) >>> 1;  // 找到数组的中点，用来分成[lo..mid]和[mid+1..hi]
+            /**
+             * 构造左子future节点a，以及右future子节点b
+             */
+            if((a = (lo == mid ? cfs[lo] : andTree(cfs, lo, mid))) == null ||
+               (b = (lo == hi ? a : (hi == mid + 1) ? cfs[hi] : andTree(cfs, mid + 1, hi))) == null) {
+                throw new NullPointerException();
+            }
+            if((r = a.result) == null || (s = b.result) == null) {  // a和b的result只要有一个没算完，则入stack
+                a.bipush(b, new BiRelay<>(d, a, b));
+            }else if ((r instanceof AltResult
+                        && (x = ((AltResult)(z = r)).ex) != null)
+                        || (s instanceof AltResult && (x = ((AltResult)(z = s)).ex) != null))
+                    d.result = encodeThrowable(x, z);
+                else
+                    d.result = NIL;
+        }
+        return d;
+    }
+
     /* ------------- Projected (Ored) BiCompletions -------------- */
 
     final void orpush(CompletableFuture<?> b, BiCompletion<?,?,?> c) {
@@ -1442,11 +1536,403 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         return d;
     }
 
+    /**
+     * anyOf专用的Completion，用来挂到每一个Future的stack上等待最终赋值
+     */
+    static class AnyOf extends Completion {
+        CompletableFuture<Object> dep;
+        CompletableFuture<?> src;
+        CompletableFuture<?>[] srcs;
+
+        AnyOf(CompletableFuture<Object> dep, CompletableFuture<?> src, CompletableFuture<?>[] srcs) {
+            this.dep = dep;
+            this.src = src;
+            this.srcs = srcs;
+        }
+
+        final CompletableFuture<Object> tryFire(int mode) {
+            CompletableFuture<Object> d;    // dep
+            CompletableFuture<?> a; // src
+            CompletableFuture<?>[] as;  // srcs
+            Object r;
+            if ((a = src) == null || (r = a.result) == null || (d = dep) == null || (as = srcs) == null)
+                return null;
+            // 到这里就是src已经计算出结果了，要竞争给d赋值result（因为d会关联srcs的每个future的stack）
+            src = null; dep = null; srcs = null;
+            if(d.completeRelay(r)) {    // CAS赋值
+                for(CompletableFuture<?> b : as) {  // 赋值成功了，清理其它future的stack
+                    if(b != a)
+                        b.cleanStack();
+                }
+                if(mode < 0)
+                    return d;
+                else
+                    d.postComplete();
+            }
+            return null;
+        }
+
+        final boolean isLive() {
+            CompletableFuture<Object> d;
+            return (d = dep) != null && d.result == null;
+        }
+    }
+
     /* ------------- Zero-input Async forms -------------- */
+
+    static final class AsyncSupply<T> extends ForkJoinTask<Void> implements Runnable, AsynchronousCompletionTask {
+        CompletableFuture<T> dep;
+        Supplier<? extends T> fn;
+
+        AsyncSupply(CompletableFuture<T> dep, Supplier<? extends T> fn) {
+            this.dep = dep;
+            this.fn = fn;
+        }
+
+        public final Void getRawResult() {
+            return null;
+        }
+
+        public final void setRawResult(Void v) {}
+
+        public final boolean exec() {
+            run();
+            return false;
+        }
+
+        public void run() {
+            CompletableFuture<T> d;
+            Supplier<? extends T> f;
+            if((d = dep) != null && (f = fn) != null) {
+                dep = null;
+                fn = null;
+                if(d.result == null) {
+                    try {
+                        d.completeValue(f.get());
+                    } catch (Throwable ex) {
+                        d.completeThrowable(ex);
+                    }
+                }
+                d.postComplete();
+            }
+        }
+    }
+
+    static <U> CompletableFuture<U> asyncSupplyStage(Executor e, Supplier<U> f) {
+        if (f == null)
+            throw new NullPointerException();
+        CompletableFuture<U> d = new CompletableFuture<>();
+        e.execute(new AsyncSupply<U>(d, f));
+        return d;
+    }
+
+    static final class AsyncRun extends ForkJoinTask<Void> implements Runnable, AsynchronousCompletionTask {
+        CompletableFuture<Void> dep;
+        Runnable fn;
+
+        AsyncRun(CompletableFuture<Void> dep, Runnable fn) {
+            this.dep = dep;
+            this.fn = fn;
+        }
+
+        public final Void getRawResult() {
+            return null;
+        }
+
+        public final void setRawResult(Void v) {}
+
+        public final boolean exec() {
+            run();
+            return false;
+        }
+
+        public void run() {
+            CompletableFuture<Void> d;
+            Runnable f;
+            if ((d = dep) != null && (f = fn) != null) {
+                dep = null;
+                fn = null;
+                if(d.result == null) {
+                    try {
+                        f.run();
+                        d.completeNull();
+                    } catch (Throwable ex) {
+                        d.completeThrowable(ex);
+                    }
+                }
+                d.postComplete();
+            }
+        }
+    }
+
+    static CompletableFuture<Void> asyncRunStage(Executor e, Runnable f) {
+        if(f == null)
+            throw new NullPointerException();
+        CompletableFuture<Void> d = new CompletableFuture<>();
+        e.execute(new AsyncRun(d, f));
+        return d;
+    }
 
     /* ------------- Signallers -------------- */
 
+    /**
+     * 等待线程的Completion实现。
+     * Completion本质代表：CompletableFuture完成后要执行的动作。
+     * 这个Signaller代表：CompletableFuture完成后要唤醒的线程（等待线程本身会挂到stack里面）。
+     */
+    static final class Signaller extends Completion implements ForkJoinPool.ManagedBlocker {
+        long nanos;
+        final long deadline;
+        final boolean interruptible;
+        boolean interrupted;
+        volatile Thread thread;
+
+        Signaller(boolean interruptible, long nanos, long deadline) {
+            this.thread = Thread.currentThread();
+            this.interruptible = interruptible;
+            this.nanos = nanos;
+            this.deadline = deadline;
+        }
+
+        final CompletableFuture<?> tryFire(int ignore) {
+            Thread w;
+            if((w = thread) != null) {
+                thread = null;
+                LockSupport.unpark(w);
+            }
+            return null;
+        }
+
+        public boolean isReleasable() {
+            if(Thread.interrupted())
+                interrupted = true;
+            return ((interrupted && interruptible)
+                    || (deadline != 0L && (nanos <= 0L || (nanos = deadline - System.nanoTime()) <= 0L))
+                    || thread == null);
+        }
+
+        public boolean block() {
+            while(!isReleasable()) {
+                if(deadline == 0L)  // 不带等待时间的，就是一直阻塞，否则只阻塞给定时间
+                    LockSupport.park(this);
+                else
+                    LockSupport.parkNanos(this, nanos);
+            }
+            return true;
+        }
+
+        final boolean isLive() {
+            return thread != null;
+        }
+    }
+
+    /**
+     * 等待后返回原始计算结果，如果interruptible为true则被中断后返回null。
+     */
+    private Object waitingGet(boolean interruptible) {
+        if(interruptible && Thread.interrupted())
+            return null;
+        Signaller q = null;
+        boolean queued = false;
+        Object r;
+        while((r = result) == null) {
+            if(q == null) {
+                q = new Signaller(interruptible, 0L, 0L);   // 一直阻塞的版本
+                /**
+                 * 非常重要的特殊处理，ForkJoinPool的worker线程不能被普通阻塞，因为ForkJoinPool有work-stealing机制，
+                 * 如果worker阻塞了，pool可能出现starvation，所以要执行helpAsyncBlocker方法，
+                 * 允许worker在等待期间执行其它任务，这就是ForkJoinPoll的managed blocking机制。
+                 */
+                if(Thread.currentThread() instanceof ForkJoinWorkerThread)
+                    ForkJoinPool.helpAsyncBlocker(defaultExecutor(), q);
+            }else if(!queued) {
+                queued = tryPushStack(q);   // 把Signaller入栈stack
+            }else if(interruptible && q.interrupted) {
+                q.thread = null;
+                cleanStack();
+                return null;
+            }else {
+                try {
+                    /**
+                     * 真正的阻塞线程，注意Signaller实现了ForkJoinPool.ManagedBlocker接口，
+                     * 所以managedBlock(q)里面会调用q.isReleasable()和q.block()
+                     */
+                    ForkJoinPool.managedBlock(q);
+                } catch (InterruptedException ie) { // currently cannot happen
+                    q.interrupted = true;
+                }
+            }
+        }
+        if(q != null) {
+            q.thread = null;
+            if(q.interrupted)
+                Thread.currentThread().interrupt();
+        }
+        postComplete();
+        return r;
+    }
+
+    private Object timedGet(long nanos) throws TimeoutException {
+        long d = System.nanoTime() + nanos;
+        long deadline = (d == 0L) ? 1L : d; // avoid 0
+        boolean interrupted = false;
+        boolean queued = false;
+        Signaller q = null;
+        Object r = null;
+
+        while(true) {
+            if(interrupted || (interrupted = Thread.interrupted()))
+                break;
+            else if((r = result) != null)
+                break;
+            else if(nanos <= 0L)
+                break;
+            else if(q == null) {
+                q = new Signaller(true, nanos, deadline);
+                if(Thread.currentThread() instanceof ForkJoinWorkerThread)
+                    ForkJoinPool.helpAsyncBlocker(defaultExecutor(), q);
+            }else if(!queued) {
+                queued = tryPushStack(q);
+            }else {
+                try {
+                    ForkJoinPool.managedBlock(q);
+                    interrupted = q.interrupted;
+                    nanos = q.nanos;
+                } catch (InterruptedException ie) {
+                    interrupted = true;
+                }
+            }
+        }
+        if(q != null) {
+            q.thread = null;
+            if(r == null)
+                cleanStack();
+        }
+        if(r != null) { // 有返回值，则返回正常值
+            if(interrupted)
+                Thread.currentThread().interrupt();
+            postComplete();
+            return r;
+        }else if(interrupted)   // 被中断
+            return null;
+        else    // 没有被中断，也没有返回值，则抛出异常
+            throw new TimeoutException();
+    }
+
     /* ------------- public methods -------------- */
+
+    public CompletableFuture() {}
+
+    CompletableFuture(Object r) {
+        RESULT.setRelease(this, r);
+    }
+
+    /**
+     * 重要方法：最常规的使用入口
+     */
+    public static <U> CompletableFuture<U> supplyAsync(Supplier<U> supplier) {
+        return asyncSupplyStage(ASYNC_POOL, supplier);
+    }
+
+    public static <U> CompletableFuture<U> supplyAsync(Supplier<U> supplier, Executor executor) {
+        return asyncSupplyStage(screenExecutor(executor), supplier);
+    }
+
+    public static CompletableFuture<Void> runAsync(Runnable runnable) {
+        return asyncRunStage(ASYNC_POOL, runnable);
+    }
+
+    public static CompletableFuture<Void> runAsync(Runnable runnable, Executor executor) {
+        return asyncRunStage(screenExecutor(executor), runnable);
+    }
+
+    /**
+     * 返回新的CompletableFuture，值为给定value
+     */
+    public static <U> CompletableFuture<U> completedFuture(U value) {
+        return new CompletableFuture<>(value == null ? NIL : value);
+    }
+
+    public boolean isDone() {
+        return result != null;
+    }
+
+    /**
+     * 获取result，如果未完成则会等待
+     */
+    public T get() throws InterruptedException, ExecutionException {
+        Object r;
+        if((r = result) == null)
+            r = waitingGet(true);   // 传的是true，即如果被中断则返回null
+        /**
+         * 如果被中断，则会抛出InterruptedException，如果异常，则会抛出ExecutionException
+         * get是Future接口定义的方法，所以必须遵守传统约定：
+         * 1、可中断
+         * 2、抛checked exception
+         * 3、用ExecutionException
+         * 适合兼容老式Future或传统阻塞调用
+         */
+        return (T)reportGet(r);
+    }
+
+    public T get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+        long nanos = unit.toNanos(timeout);
+        Object r;
+        if((r = result) == null)
+            r = timedGet(nanos);
+        return (T)reportGet(r);
+    }
+
+    /**
+     * 和get的区别就是waitingGet的interruptible参数传的是false（抛CompletionException而不是Checked Exception）
+     */
+    public T join() {
+        Object r;
+        if((r = result) == null)
+            /**
+             * 传的是false，即等待过程中即使被中断，也不会提前退出（所以不会抛InterruptedException，但会在返回前恢复线程的中断标记）
+             */
+            r = waitingGet(false);
+
+        /**
+         * 与reportGet不同，会直接抛CompletionException而不是ExecutionException，
+         * 更适合函数式链式风格，因为：
+         * 1、不需要checked exception
+         * 2、可以直接在lambda / pipeline里传播
+         * 这是CompletableFuture自己提供的便捷方法，目标是：
+         * 1、不写checked exception
+         * 2、更适合函数式链式调用
+         * 3、保留异常语义为CompletionException
+         * 适合stream / lambda / async pipeline风格
+         */
+        return (T) reportJoin(r);
+    }
+
+    /**
+     * 如果操作已完成，则返回result（可能是异常），否则返回给定的默认值。
+     */
+    public T getNow(T valueIfAbsent) {
+        Object r;
+        return ((r = result) == null) ? valueIfAbsent : (T)reportJoin(r);
+    }
+
+    /**
+     * 如果未完成，则将get()或相关方法返回的值设置为给定值。
+     * 最重要的方法：是整个CompletableFuture触发的起点，内部会调用postComplete从而调用stack里面Completion的tryFire方法
+     */
+    public boolean complete(T value) {
+        boolean triggered = completeValue(value);
+        postComplete();
+        return triggered;
+    }
+
+    public boolean completeExceptionally(Throwable ex) {
+        if (ex == null)
+            throw new NullPointerException();
+        boolean triggered = internalComplete(new AltResult(ex));
+        postComplete();
+        return triggered;
+    }
 
     public <U> CompletableFuture<U> thenApply(Function<? super T,? extends U> fn) {
         return uniApplyStage(null, fn); // 同步调用fn，所以参数1是null
@@ -1627,19 +2113,441 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
         return uniComposeExceptionallyStage(screenExecutor(executor), fn);
     }
 
-    // jdk9 additions
+    /* ------------- Arbitrary-arity constructions -------------- */
+
+    public static CompletableFuture<Void> allOf(CompletableFuture<?>... cfs) {
+        return andTree(cfs, 0, cfs.length - 1);
+    }
+
+    /**
+     * 只要给定的cfs里面有一个Future计算完成，则立即采用计算结果
+     * 比allOf要简单很多：
+     * 1、创建一个dep future，把一个Completion挂到数组给定的每个future的stack上，
+     * 2、哪个future先完成计算，则调用dep.complete(result)即可。
+     */
+    public static CompletableFuture<Object> anyOf(CompletableFuture<?>... cfs) {
+        int n;
+        Object r;
+        if((n = cfs.length) <= 1) { // 如果数组里面只有0或1个CompletableFuture
+            return n == 0
+                    ? new CompletableFuture<>()
+                    : uniCopyStage(cfs[0]);
+        }
+
+        for(CompletableFuture<?> cf : cfs) {    // 如果cfs里面已经有的算出result了，直接使用即可
+            if((r = cf.result) != null)
+                return new CompletableFuture<>(encodeRelay(r));
+        }
+
+        cfs = cfs.clone();
+        CompletableFuture<Object> d = new CompletableFuture<>();
+        for(CompletableFuture<?> cf : cfs)
+            cf.unipush(new AnyOf(d, cf, cfs));
+        return d;
+    }
+
+    /* ------------- Control and status methods -------------- */
+
+    /**
+     * 如果尚未完成，则使用CancellationException完成此CompletableFuture。
+     * 尚未完成的依赖CompletableFutures也将异常完成，并抛出由该CancellationException引发的CompletionException。
+     */
+    public boolean cancel(boolean mayInterruptIfRunning) {
+        // 调用internalComplete将result设置为CancellationException
+        boolean cancelled = (result == null) && internalComplete(new AltResult(new java.util.concurrent.CancellationException()));
+        postComplete();
+        return cancelled || isCancelled();
+    }
+
+    public boolean isCancelled() {
+        Object r;
+        return ((r = result) instanceof AltResult && (((AltResult)r).ex instanceof CancellationException);
+    }
+
+    public boolean isCompletedExceptionally() {
+        Object r;
+        return ((r = result) instanceof AltResult) && r != NIL;
+    }
+
+    /**
+     * 强制设置或重置方法get()及相关方法后续返回的值，无论该值是否已完成。
+     * 此方法仅适用于错误恢复操作，即便在此类场景下，仍可能导致正在进行的依赖性完成操作使用已建立的结果而非覆盖后的结果。
+     */
+    public void obtrudeValue(T value) {
+        result = (value == null) ? NIL : value;
+        postComplete();
+    }
+
+    public void obtrudeException(Throwable ex) {
+        if(ex == null)
+            throw new NullPointerException();
+        result = new AltResult(ex);
+        postComplete();
+    }
+
+    /**
+     * 返回估计的CompletableFutures数量，这些CompletableFutures的完成状态正在等待此CompletableFuture的完成。
+     * 此方法旨在用于监控系统状态，而非用于同步控制。
+     */
+    public int getNumberOfDependents() {
+        int count = 0;
+        for(Completion p = stack; p != null; p = p.next)
+            ++count;
+        return count;
+    }
+
+    public String toString() {
+        Object r = result;
+        int count = 0;
+        for(Completion p = stack; p != null; p = p.next)
+            ++count;
+        return super.toString() +
+                ((r == null)
+                        ? ((count == 0)
+                        ? "[Not completed]"
+                        : "[Not completed, " + count + " dependents]")
+                        : (((r instanceof AltResult) && ((AltResult)r).ex != null)
+                        ? "[Completed exceptionally: " + ((AltResult)r).ex + "]"
+                        : "[Completed normally]"));
+    }
+
+    /**
+     * 以下是JDK9新增的功能，为了补全原版工程上缺少的能力：
+     * 1、超时控制不方便：例如要实现3秒超时失败，5秒超时默认值，需要自己额外搞ScheduledExecutorService
+     * 所以新版增加了orTimeout、completeOnTimeout和delayedExecutor
+     * 2、只想暴露CompletionStage视图：比如你只想返回给调用方一个只能调用thenApply或thenCompose的对象，不想让他们complete或obtrude
+     * 所以新版增加了minimalCompletionStage和MinimalStage
+     * 3、想更方便地异步不全：比如你已经有了一个CompletableFuture f，想让它异步地被一个Supplier完成
+     * 所以新版增加了completeAsync
+     * 4、快速构造已失败的future或stage：原版方法只有completedFuture，没有failedFuture或failedStage。
+     */
 
     /**
      * 返回新的、未完成的CompletableFuture对象。
      * 其类型与CompletionStage方法返回的类型相同，子类通常应重写此方法，以返回与当前CompletableFuture相同类的实例。
      * 默认实现返回CompletableFuture类的实例
+     *
+     * 目的是为了让子类可以重写，保证链式API返回的还是子类。
      */
     public <U> CompletableFuture<U> newIncompleteFuture() {
         return new CompletableFuture<>();
     }
 
+    /**
+     * 子类扩展用
+     */
     public Executor defaultExecutor() {
         return ASYNC_POOL;
+    }
+
+    /**
+     * 返回一个：结果一样，但不能由外部随便complete原对象的副本视图，作用是防御性复制。
+     */
+    public CompletableFuture<T> copy() {
+        return uniCopyStage(this);
+    }
+
+    /**
+     * 返回一个只暴露CompletionStage能力的视图
+     */
+    public CompletionStage<T> minimalCompletionStage() {
+        return uniAsMinimalStage();
+    }
+
+    /**
+     * 和原版supplyAsync的区别是：
+     * 1、supplyAsync意思是：创建一个新的Future，并异步执行Supplier来完成它。
+     * 2、completeAsync意思是：我已经有一个future了，现在只要安排一个异步任务，将来去complete它。
+     */
+    public CompletableFuture<T> completeAsync(Supplier<? extends T> supplier, Executor executor) {
+        if(supplier == null || executor == null)
+            throw new NullPointerException();
+        executor.execute(new AsyncSupply<>(this, supplier));    // 注意这里dep传的是this，而不是一个新的Future
+        return this;
+    }
+
+    public CompletableFuture<T> completeAsync(Supplier<? extends T> supplier) {
+        return completeAsync(supplier, defaultExecutor());
+    }
+
+    /**
+     * 如果Future在指定时间还没有完成result，则result设为TimeoutException
+     */
+    public CompletableFuture<T> orTimeout(long timeout, TimeUnit unit) {
+        if(unit == null)
+            throw new NullPointerException();
+        if(result == null)
+            whenComplete(new Canceller(Delayer.delayer(new Timeout(this), timeout, unit)));
+        return this;
+    }
+
+    /**
+     * 和orTimeout唯一区别就是当超时了，result不是TimeoutException而是默认值
+     */
+    public CompletableFuture<T> completeOnTimeout(T value, long timeout, TimeUnit unit) {
+        if(unit == null)
+            throw new NullPointerException();
+        if(result == null)
+            whenComplete(new Canceller(Delayer.delay(new DelayedCompleter<T>(this, value), timeout, unit)));
+        return this;
+    }
+
+    public static Executor delayedExecutor(long delay, TimeUnit unit, Executor executor) {
+        if(unit == null || executor == null)
+            throw new NullPointerException();
+        return new DelayedExecutor(delay, unit, executor);
+    }
+
+    public static Executor delayedExecutor(long delay, TimeUnit unit) {
+        if(unit == null)
+            throw new NullPointerException();
+        return new DelayedExecutor(delay, unit, ASYNC_POOL);
+    }
+
+    public static <U> CompletionStage<U> completedStage(U value) {
+        return new MinimalStage<U>((value == null) ? NIL : value);
+    }
+
+    public static <U> CompletableFuture<U> failedFuture(Throwable ex) {
+        if(ex == null)
+            throw new NullPointerException();
+        return new CompletableFuture<>(new AltResult(ex));
+    }
+
+    public static <U> CompletionStage<U> failedStage(Throwable ex) {
+        if(ex == null)
+            throw new NullPointerException();
+        return new MinimalStage<>(new AltResult(ex));
+    }
+
+    /**
+     * 基于单例的延迟调度器，仅用于启动和取消任务。
+     * 即负责过一段时间触发某个Runnable
+     */
+    static final class Delayer {
+        static final ScheduledThreadPoolExecutor delayer;
+
+        static final class DaemonThreadFactory implements ThreadFactory {
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r);
+                t.setDaemon(true);
+                t.setName("CompletableFutureDelayScheduler");
+                return t;
+            }
+        }
+
+        static {
+            (delayer = new ScheduledThreadPoolExecutor(1,
+                                                     new DaemonThreadFactory())).setRemoveOnCancelPolicy(true);
+        }
+
+        static ScheduledFuture<?> delay(Runnable command, long delay, TimeUnit unit) {
+            return delayer.schedule(command, delay, unit);
+        }
+    }
+
+    /**
+     * 小型类化lambda表达式，以更好地支持监控。
+     * 内部使用的是上面的Delayer
+     */
+    static final class DelayedExecutor implements Executor {
+        final long delay;
+        final TimeUnit unit;
+        final Executor executor;
+
+        DelayedExecutor(long delay, TimeUnit unit, Executor executor) {
+            this.delay = delay;
+            this.unit = unit;
+            this.executor = executor;
+        }
+
+        public void execute(Runnable r) {
+            Delayer.delay(new TaskSubmitter(executor, r), delay, unit);
+        }
+    }
+
+    /**
+     * 提交用户任务的操作封装
+     */
+    static final class TaskSubmitter implements Runnable {
+        final Executor executor;
+        final Runnable action;
+
+        TaskSubmitter(Executor executor, Runnable action) {
+            this.executor = executor;
+            this.action = action;
+        }
+
+        public void run() {
+            executor.execute(action);
+        }
+    }
+
+    /**
+     * 如果给定的Future未完成，则在result写入TimeoutException的任务
+     * 职责是将给定的CompletableFuture的result设置TimeoutException
+     */
+    static final class Timeout implements Runnable {
+        final CompletableFuture<?> f;
+
+        Timeout(CompletableFuture<?> f) {
+            this.f = f;
+        }
+
+        public void run() {
+            if(f != null && !f.isDone())
+                f.completeExceptionally(new java.util.concurrent.TimeoutException());
+        }
+    }
+
+    /**
+     * 将给定的Future的result写入特定值，
+     */
+    static final class DelayedCompleter<U> implements Runnable {
+        final CompletableFuture<U> f;
+        final U u;
+
+        DelayedCompleter(CompletableFuture<U> f, U u) {
+            this.f = f;
+            this.u = u;
+        }
+
+        public void run() {
+            if(f != null)
+                f.complete(u);
+        }
+    }
+
+    /**
+     * 用来取消Timeout任务的Future，注意只有上游正常完成才会调用这里面的accept，超时未完成则会触发future里面的Timeout动作。
+     */
+    static final class Canceller implements BiConsumer<Object, Throwable> {
+        final Future<?> f;
+
+        Canceller(Future<?> f) {
+            this.f = f;
+        }
+
+        public void accept(Object ignore, Throwable ex) {
+            /**
+             * 重点逻辑：当进入到这个accept时候，说明上游result已经算出来了，不应该再写TimeoutException了
+             * 如果Future还没执行（注意这个Future指的是负责给result写TimeoutException的任务），
+             * 就要把它给cancel（不然调了也是白调，因为result的值已经定下来了）
+             */
+            if(ex == null && f != null && !f.isDone())
+                f.cancel(false);
+        }
+    }
+
+    /**
+     * 只能调用CompletionStage的方法，CompletableFuture中不应调用的方法全部重写了
+     */
+    static final class MinimalStage<T> extends CompletableFuture<T> {
+        MinimalStage() {}
+
+        MinimalStage(Object r) {
+            super(r);
+        }
+
+        @Override
+        public <U> CompletableFuture<U> newIncompleteFuture() {
+            return new MinimalStage<>();
+        }
+        @Override
+        public T get() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public T get(long timeout, TimeUnit unit) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public T getNow(T valueIfAbsent) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public T join() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean complete(T value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean completeExceptionally(Throwable ex) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void obtrudeValue(T value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void obtrudeException(Throwable ex) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean isDone() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean isCancelled() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean isCompletedExceptionally() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public int getNumberOfDependents() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CompletableFuture<T> completeAsync(Supplier<? extends T> supplier, Executor executor) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CompletableFuture<T> completeAsync(Supplier<? extends T> supplier) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CompletableFuture<T> orTimeout(long timeout, TimeUnit unit) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CompletableFuture<T> completeOnTimeout(T value, long timeout, TimeUnit unit) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public CompletableFuture<T> toCompletableFuture() {
+            Object r;
+            if((r = result) != null)
+                return new CompletableFuture<T>(encodeRelay(r));
+            else {
+                CompletableFuture<T> d = new CompletableFuture<>();
+                unipush(new UniRelay<>(d, this));
+                return d;
+            }
+        }
     }
 
     // VarHandle mechanics
