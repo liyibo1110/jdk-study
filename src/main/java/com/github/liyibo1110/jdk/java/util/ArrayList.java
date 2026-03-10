@@ -588,11 +588,11 @@ public class ArrayList<E> extends AbstractList<E>
                 lastRet = i - 1;
                 checkForComodification();
             }
+        }
 
-            final void checkForComodification() {
-                if(modCount != expectedModCount)
-                    throw new ConcurrentModificationException();
-            }
+        final void checkForComodification() {
+            if(modCount != expectedModCount)
+                throw new ConcurrentModificationException();
         }
     }
 

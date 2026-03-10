@@ -2161,7 +2161,7 @@ public class CompletableFuture<T> implements Future<T>, CompletionStage<T> {
 
     public boolean isCancelled() {
         Object r;
-        return ((r = result) instanceof AltResult && (((AltResult)r).ex instanceof CancellationException);
+        return ((r = result) instanceof AltResult && (((AltResult)r).ex instanceof CancellationException));
     }
 
     public boolean isCompletedExceptionally() {
