@@ -209,6 +209,38 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
     }
 
     /**
+     * 检查给定node是否在队列中
+     */
+    final boolean isEnqueued(Node node) {
+        for(Node t = tail; t != null; t = t.prev) {
+            if(t == node)
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * 唤醒指定节点的继承者（若存在），并取消其WAITING状态以避免停驻竞争。
+     * 当一个或多个线程已被取消时，此操作可能无法唤醒符合条件线程，但cancelAcquire可确保系统活性。
+     */
+    private static void signalNext(Node h) {
+        Node s;
+        /** head.next要有node，并且status不能是0（得是等待状态） */
+        if(h != null && (s = h.next) != null && s.status != 0) {
+            s.getAndUnsetStatus(WAITING);   // status尝试改成0
+            LockSupport.unpark(s.waiter);   // 唤醒里面的线程
+        }
+    }
+
+    private static void signalNextIfShared(Node h) {
+        Node s;
+        if(h != null && (s = h.next) != null && s instanceof SharedNode && s.status != 0) {
+            s.getAndUnsetStatus(WAITING);
+            LockSupport.unpark(s.waiter);
+        }
+    }
+
+    /**
      * 核心acquire方法，由所有对外的acquire方法来调用。
      * @param node 除非重新获取Condition，否则为null。
      * @param arg 来自acquire的arg参数
@@ -284,6 +316,15 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
                 boolean acquired;
                 try {
                     // 尝试获取锁，不同的实现类会走不同的路径
+
+                    /**
+                     * 这里要讲一下如果是shared模式的特点：
+                     * 如果是独占模式，tryAcquire的结果只有true和false两种，
+                     * 如果是共享模式，tryAcquireShared返回值是个int，会有3种结果：
+                     * 1、result < 0：获取失败，需要排队。
+                     * 2、result = 0：获取成功，但资源已经耗尽。
+                     * 3、result > 0：获取成功，而且后买你线程也可能成功。
+                     */
                     if(shared)
                         acquired = (tryAcquireShared(arg) >= 0);
                     else
@@ -480,12 +521,85 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
      * 通过至少调用一次tryAcquire实现，成功时返回。否则线程将被加入队列，可能反复阻塞和解除阻塞，持续调用tryAcquire直至成功。
      * 此方法可用于实现Lock.lock方法。
      *
-     * PS：这也是学习AQS的入口方法
+     * PS：这也是学习AQS的入口方法之一
      * @param arg
      */
     public final void acquire(int arg) {
         if(!tryAcquire(arg))
             acquire(null, arg, false, false, false, 0L);
+    }
+
+    /**
+     * 以独占模式获取，若被中断则中止。
+     * 实现方式为：先检查中断状态，随后至少调用一次tryAcquire，成功则返回。
+     * 否则将线程加入队列，可能反复阻塞与解除阻塞，持续调用tryAcquire直至成功或该线程被中断。
+     * 此方法可用于实现Lock.lockInterruptibly方法。
+     */
+    public final void acquireInterruptibly(int arg) throws InterruptedException {
+        /**
+         * 这里的acquire的参数interruptible参数是true，也就是如果中断了，acquire会返回负数，最终抛出InterruptedException
+         */
+        if(Thread.interrupted() || (!tryAcquire(arg) && acquire(null, arg, false, true, false, 0L) < 0))
+            throw new InterruptedException();
+    }
+
+    public final boolean tryAcquireNanos(int arg, long nanosTimeout) throws InterruptedException {
+        if(!Thread.interrupted()) {
+            if(tryAcquire(arg))
+                return true;
+            if(nanosTimeout <= 0L)
+                return false;
+            int stat = acquire(null, arg, false, true, true, System.nanoTime() + nanosTimeout);
+            if(stat > 0)
+                return true;
+            if(stat == 0)   // acquire返回0代表出现了异常，中断或超时了
+                return false;
+        }
+        throw new InterruptedException();
+    }
+
+    /**
+     * 以独占模式释放。通过在tryRelease返回true时解除一个或多个线程的锁定来实现。此方法可用于实现Lock.unlock方法。
+     */
+    public final boolean release(int arg) {
+        if(tryRelease(arg)) {
+            signalNext(head);
+            return true;
+        }
+        return false;
+    }
+
+    public final void acquireShared(int arg) {
+        if(tryAcquireShared(arg) < 0)
+            acquire(null, arg, true, false, false, 0L);
+    }
+
+    public final void acquireSharedInterruptibly(int arg) throws InterruptedException {
+        if(Thread.interrupted() || (tryAcquireShared(arg) < 0 && acquire(null, arg, true, true, false, 0L) < 0))
+            throw new InterruptedException();
+    }
+
+    public final boolean tryAcquireSharedNanos(int arg, long nanosTimeout) throws InterruptedException {
+        if(!Thread.interrupted()) {
+            if(tryAcquireShared(arg) >= 0)
+                return true;
+            if(nanosTimeout <= 0L)
+                return false;
+            int stat = acquire(null, arg, true, true, true, System.nanoTime() + nanosTimeout);
+            if(stat > 0)
+                return true;
+            if(stat == 0)
+                return false;
+        }
+        throw new InterruptedException();
+    }
+
+    public final boolean releaseShared(int arg) {
+        if(tryReleaseShared(arg)) {
+            signalNext(head);
+            return true;
+        }
+        return false;
     }
 
     // Queue inspection methods
