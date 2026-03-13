@@ -1,12 +1,14 @@
 package com.github.liyibo1110.jdk.java.util.concurrent.locks;
 
 import jdk.internal.misc.Unsafe;
-import org.w3c.dom.Node;
 
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Date;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 
@@ -206,6 +208,32 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
         Node h = new ExclusiveNode();
         if(U.compareAndSetReference(this, HEAD, null, h))
             tail = h;   // 如果队列是空的，则tail也指向一样的唯一节点
+    }
+
+    /**
+     * 将node加入到AQS queue，这个方法会用在ConditionObject里面（从condition queue回到AQS queue会用到）
+     */
+    final void enqueue(Node node) {
+        if(node != null) {
+            while(true) {
+                Node t = tail;
+                node.setPrevRelaxed(t); // node.prev = t
+                if(t == null)   // AQS queue还没有被初始化
+                    tryInitializeHead();
+                else if(casTail(t, node)) { // 尝试将tail指向node
+                    t.next = node;
+                    /**
+                     * 非常重要的一个判断，因为status < 0代表是CANCELLED状态，
+                     * AQS的唤醒链条是从前往后一个一个唤醒的，如果遇到了CANCELLED的node，它就不会再继续唤醒后面的node了，
+                     * 这样唤醒链条会出问题，所以这里的解决方法是：直接唤醒新加入的node，让它自己参与queue修复，
+                     * 所谓修复就是，唤醒后的线程又会执行acquire去抢锁，在循环中会发现pred是CANCELLED，就会执行cleanQueue方法了
+                     */
+                    if(t.status < 0)
+                        LockSupport.unpark(node.waiter);
+                    break;  // 成功加入node就退出
+                }
+            }
+        }
     }
 
     /**
@@ -762,6 +790,347 @@ public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchron
         private transient ConditionNode lastWaiter;
 
         public ConditionObject() {}
+
+        // Signalling methods
+
+        /**
+         * 移除并转移一个或所有waiter至AQS queue
+         */
+        private void doSignal(ConditionNode first, boolean all) {
+            while(first != null) {
+                ConditionNode next = first.nextWaiter;
+                if((firstWaiter = null) == null)    // 直接将头节点指向下一个（first尝试移回AQS queue），这里为true说明队列已经空了
+                    lastWaiter = null;
+                if((first.getAndUnsetStatus(COND) & COND) != 0) {   // 判断并取消COND状态
+                    enqueue(first);
+                    if(!all)    // all为true则会转移全部
+                        break;
+                }
+                first = next;
+            }
+        }
+
+        /**
+         * 若存在最长等待线程，则将其从condition queue移至AQS queue。
+         */
+        public final void signal() {
+            ConditionNode first = firstWaiter;
+            if(!isHeldExclusively())    // 和await规则一样，调用signal的线程，之前必须拿到锁
+                throw new IllegalMonitorStateException();
+            if(first != null)
+                doSignal(first, false);
+        }
+
+        public final void signalAll() {
+            ConditionNode first = firstWaiter;
+            if(!isHeldExclusively())    // 和await规则一样，调用signal的线程，之前必须拿到锁
+                throw new IllegalMonitorStateException();
+            if(first != null)
+                doSignal(first, true);
+        }
+
+        // Waiting methods
+
+        /**
+         * 将ConditionNode添加到condition queue中并释放锁
+         * 返回值的当前线程持有锁的数量（也是还回去的数量）。
+         */
+        private int enableWait(ConditionNode node) {
+            // 注意所有的Condition操作，说的都是线程已经拿到锁的前提下，没拿到还调里面的方法直接会得到异常
+            if(isHeldExclusively()) {
+                // 给node赋值，因为进来时候node是空的
+                node.waiter = Thread.currentThread();
+                node.setStatusRelaxed(COND | WAITING);
+                ConditionNode last = lastWaiter;
+                if(last == null)    // 队列为空
+                    firstWaiter = node;
+                else
+                    last.nextWaiter = node;
+                lastWaiter = node;
+                /**
+                 * 非常重要的操作，这里是在获取当前线程的持有锁次数（因为可以重入，可以有很多）。
+                 * 获取次数后，因为自己已经等待了，要把所有锁还回去。
+                 */
+                int savedState = getState();
+                if(release(savedState))
+                    return savedState;
+            }
+            node.status = CANCELLED;
+            throw new IllegalMonitorStateException();
+        }
+
+        /**
+         * 如果给定ConditionNode是否又进入了AQS queue，是否可以走acquire重新获取锁了。
+         * 如果还在condition queue中，返回false。
+         * 如果被signal转移回AQS queue了，则返回true。
+         */
+        private boolean canReacquire(ConditionNode node) {
+            return node != null && node.prev != null && isEnqueued(node);
+        }
+
+        /**
+         * 将指定node以及其他非等待node从condition queue中解除关联，除非node已经解除了关联。
+         */
+        private void unlinkCancelledWaiters(ConditionNode node) {
+            /**
+             * 满足以下三个条件之一才会尝试unlink
+             * 1、方法调用者并没有传有效的node，只能扫描全链路
+             * 2、node还在condition queue里面（因为还有nextWaiter），所以可能需要清理。
+             * 3、node是在链表尾，尾节点被cancel时，链表结构最容易被破坏，需要清理。
+             */
+            if(node == null || node.nextWaiter != null || node == lastWaiter) {
+                ConditionNode w = firstWaiter;  // 当前扫描node
+                ConditionNode trail = null; // 上一个合法node
+                while(w != null) {
+                    ConditionNode next = w.nextWaiter;
+                    if((w.status & COND) == 0) {    // node不是COND了，进入摘除环节
+                        w.nextWaiter = null;    // 断掉next，使node脱离
+                        if(trail == null)   // 这个成立说明node是头节点（因为trail只有第一次循环进来是null），next给头节点即可
+                            firstWaiter = next;
+                        else    // node是中间节点，上一个合法node的next，连上node的next
+                            trail.nextWaiter = next;
+                        if(next == null)    // node是尾节点，上一个合法node就是尾节点了
+                            lastWaiter = trail;
+                    }else {
+                        trail = w;
+                    }
+                    w = next;
+                }
+            }
+        }
+
+        /**
+         * 无中断条件的await：
+         * 1、保存由getState返回的锁状态。
+         * 2、调用release时将保存的状态作为参数，如果失败抛出IllegalMonitorStateException。
+         * 3、阻塞直至收到signal。
+         * 4、调用acquire来尝试获取锁
+         */
+        public final void awaitUninterruptibly() {
+            ConditionNode node = new ConditionNode();
+            int savedState = enableWait(node);
+            LockSupport.setCurrentBlocker(this);
+            boolean interrupted = false;
+            boolean rejected = false;
+            while(!canReacquire(node)) {
+                if(Thread.interrupted())
+                    interrupted = true;
+                else if((node.status & COND) != 0) {
+                    try {
+                        if(rejected)
+                            node.block();
+                        else
+                            ForkJoinPool.managedBlock(node);
+                    } catch (RejectedExecutionException ex) {
+                        rejected = true;
+                    } catch (InterruptedException ie) {
+                        interrupted = true;
+                    }
+                }else
+                    Thread.onSpinWait();
+            }
+            LockSupport.setCurrentBlocker(null);
+            node.clearStatus();
+            acquire(node, savedState, false, false, false, 0L);
+            if(interrupted)
+                Thread.currentThread().interrupt();
+        }
+
+        /**
+         * 实现可中断条件等待：
+         * 1、若当前线程被中断，抛出InterruptedException。
+         * 2、保存getState方法返回的锁状态。
+         * 3、使用保存的状态作为参数调用release方法，若失败则抛出IllegalMonitorStateException。
+         * 4、阻塞直至收到信号或被中断。
+         * 5、通过调用带保存状态参数的专用acquire版本重新获取锁。
+         * 6、若在步骤4阻塞期间被中断，则抛出InterruptedException。
+         */
+        public final void await() throws InterruptedException {
+            if(Thread.interrupted())
+                throw new InterruptedException();
+            ConditionNode node = new ConditionNode();
+            int savedState = enableWait(node);  // 初始化node，并且加入condition queue，然后释放锁
+            LockSupport.setCurrentBlocker(this);    // 明确说明当前线程是因为ConditionObject才阻塞的
+
+            boolean interrupted = false;
+            boolean cancelled = false;
+            boolean rejected = false;
+
+            /**
+             * 主循环，只要当前节点还不能重新进入AQS获取锁，就继续等待
+             */
+            while(!canReacquire(node)) {
+                // 还在condition queue里面
+                if(interrupted |= Thread.interrupted()) {   // 线程是否被中断，中断则先打标记
+                    /**
+                     * 尝试把node的COND状态给去掉，并且判断在去掉之前，它是不是还处于COND状态。
+                     * 可以理解成：中断发生时，这个node是不是还在condition queue里。
+                     * 如果结果是true，则直接跳出while循环，在方法最后抛出Thread.currentThread().interrupt();
+                     * 如果结果是false，则说明node已经被signal过了，正在转移或者已经转移到AQS queue了，
+                     * 也就是说中断发生在signal之后，这种情况下await不会异常退出，而是继续后面的重新抢锁流程，最后再恢复中断标记，
+                     * await对signal前还是后被中断，处理逻辑不一样。
+                     */
+                    if(cancelled = (node.getAndUnsetStatus(COND) & COND) != 0)
+                        break;
+                }else if((node.status & COND) != 0) {   // 如果没中断，但是还在condition queue里，就继续阻塞
+                    try {
+                        if(rejected)    // rejected被打标发生在调用managedBlock上，如果方法不可用或者node被拒绝，则进入RejectedExecutionException
+                            node.block();   // managedBlock不适用就走这个正常LockSupport.park路径
+                        else    // 如果当前线程是ForkJoinPool的worker线程，managedBlock可以让FJP做补偿，避免线程池并行度下降
+                            ForkJoinPool.managedBlock(node);
+                    } catch (RejectedExecutionException ex) {
+                        rejected = true;
+                    } catch (InterruptedException ie) {
+                        interrupted = true;
+                    }
+                }else // 能进这里说明node的status已经不是COND了，即node被signal了，正在从condition queue转到AQS queue
+                    Thread.onSpinWait();
+            }
+            // 到这里说明当前节点已经回到AQS queue里面了，可以抢锁了
+            LockSupport.setCurrentBlocker(null);
+            node.clearStatus();
+            acquire(node, savedState, false, false, false, 0L);
+            if(interrupted) {
+                if(cancelled) { // 被中断同时还被取消了，直接移除node并抛出异常
+                    unlinkCancelledWaiters(node);
+                    throw new InterruptedException();
+                }
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        public final long awaitNanos(long nanosTimeout) throws InterruptedException {
+            if(Thread.interrupted())
+                throw new InterruptedException();
+            ConditionNode node = new ConditionNode();
+            int savedState = enableWait(node);
+            long nanos = (nanosTimeout < 0L) ? 0L : nanosTimeout;
+            long deadline = System.nanoTime() + nanos;
+            boolean cancelled = false;
+            boolean interrupted = false;
+            while(!canReacquire(node)) {
+                if((interrupted |= Thread.interrupted()) || (nanos = deadline - System.nanoTime()) <= 0L) {
+                    if(cancelled = (node.getAndUnsetStatus(COND) & COND) != 0)
+                        break;
+                }else
+                    LockSupport.parkNanos(this, nanos);
+            }
+            node.clearStatus();
+            acquire(node, savedState, false, false, false, 0L);
+            if(cancelled) {
+                unlinkCancelledWaiters(node);
+                if(interrupted)
+                    throw new InterruptedException();
+            }else if(interrupted)
+                Thread.currentThread().interrupt();
+            long remaining = deadline - System.nanoTime(); // avoid overflow
+            return (remaining <= nanosTimeout) ? remaining : Long.MIN_VALUE;
+        }
+
+        public final boolean awaitUntil(Date deadline) throws InterruptedException {
+            long abstime = deadline.getTime();
+            if(Thread.interrupted())
+                throw new InterruptedException();
+            ConditionNode node = new ConditionNode();
+            int savedState = enableWait(node);
+            boolean cancelled = false, interrupted = false;
+            while(!canReacquire(node)) {
+                if((interrupted |= Thread.interrupted()) || System.currentTimeMillis() >= abstime) {
+                    if(cancelled = (node.getAndUnsetStatus(COND) & COND) != 0)
+                        break;
+                }else
+                    LockSupport.parkUntil(this, abstime);
+            }
+            node.clearStatus();
+            acquire(node, savedState, false, false, false, 0L);
+            if(cancelled) {
+                unlinkCancelledWaiters(node);
+                if(interrupted)
+                    throw new InterruptedException();
+            }else if (interrupted)
+                Thread.currentThread().interrupt();
+            return !cancelled;
+        }
+
+        public final boolean await(long time, TimeUnit unit) throws InterruptedException {
+            long nanosTimeout = unit.toNanos(time);
+            if(Thread.interrupted())
+                throw new InterruptedException();
+            ConditionNode node = new ConditionNode();
+            int savedState = enableWait(node);
+            long nanos = (nanosTimeout < 0L) ? 0L : nanosTimeout;
+            long deadline = System.nanoTime() + nanos;
+            boolean cancelled = false, interrupted = false;
+            while(!canReacquire(node)) {
+                if((interrupted |= Thread.interrupted()) || (nanos = deadline - System.nanoTime()) <= 0L) {
+                    if(cancelled = (node.getAndUnsetStatus(COND) & COND) != 0)
+                        break;
+                }else
+                    LockSupport.parkNanos(this, nanos);
+            }
+            node.clearStatus();
+            acquire(node, savedState, false, false, false, 0L);
+            if(cancelled) {
+                unlinkCancelledWaiters(node);
+                if(interrupted)
+                    throw new InterruptedException();
+            }else if(interrupted)
+                Thread.currentThread().interrupt();
+            return !cancelled;
+        }
+
+        //  support for instrumentation
+
+        /**
+         * 如果当前ConditionObject是由给定的sync创建的，则返回true
+         */
+        final boolean isOwnedBy(AbstractQueuedSynchronizer sync) {
+            return sync == AbstractQueuedSynchronizer.this;
+        }
+
+        /**
+         * condition queue里是否还有COND状态的node。
+         */
+        protected final boolean hasWaiters() {
+            if(!isHeldExclusively())
+                throw new IllegalMonitorStateException();
+            for(ConditionNode w = firstWaiter; w != null; w = w.nextWaiter) {
+                if((w.status & COND) != 0)
+                    return true;
+            }
+            return false;
+        }
+
+        /**
+         * condition queue里处于COND状态的node的总数量。
+         */
+        protected final int getWaitQueueLength() {
+            if(!isHeldExclusively())
+                throw new IllegalMonitorStateException();
+            int n = 0;
+            for(ConditionNode w = firstWaiter; w != null; w = w.nextWaiter) {
+                if((w.status & COND) != 0)
+                    ++n;
+            }
+            return n;
+        }
+
+        /**
+         * 返回condition queue里处于COND状态的node里面的Thread。
+         */
+        protected final Collection<Thread> getWaitingThreads() {
+            if(!isHeldExclusively())
+                throw new IllegalMonitorStateException();
+            ArrayList<Thread> list = new ArrayList<>();
+            for(ConditionNode w = firstWaiter; w != null; w = w.nextWaiter) {
+                if((w.status & COND) != 0) {
+                    Thread t = w.waiter;
+                    if(t != null)
+                        list.add(t);
+                }
+            }
+            return list;
+        }
     }
 
     // Unsafe
