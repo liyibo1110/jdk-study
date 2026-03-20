@@ -226,7 +226,7 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E> implements Queue<
              */
             for(Node<E> h = head, p = h, q; ; p = q) {
                 final E item;
-                // 检查是福哦为可删除的节点，并且尝试置null
+                // 检查是否为可删除的节点，并且尝试置null
                 if((item = p.item) != null && p.casItem(item, null)) {
                     /**
                      * 如果删除的不是head，则尝试把head往前推进，因为head可能落后了，例如：
