@@ -9,11 +9,17 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.chrono.ChronoLocalDate;
 import java.time.chrono.IsoChronology;
+import java.time.chrono.IsoEra;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoField;
 import java.time.temporal.Temporal;
 import java.time.temporal.TemporalAccessor;
 import java.time.temporal.TemporalAdjuster;
+import java.time.temporal.TemporalField;
 import java.time.temporal.TemporalQueries;
+import java.time.temporal.TemporalUnit;
+import java.time.temporal.UnsupportedTemporalTypeException;
+import java.time.temporal.ValueRange;
 import java.time.zone.ZoneRules;
 import java.util.Objects;
 
@@ -160,6 +166,158 @@ public final class LocalDate implements Temporal, TemporalAdjuster, ChronoLocalD
     //-----------------------------------------------------------------------
 
     private static LocalDate create(int year, int month, int dayOfMonth) {
+        if(dayOfMonth > 28) {
+            int dom = 31;   // 经过实际year和month，计算出的最大day值
+            switch(month) {
+                case 2:
+                    dom = (IsoChronology.INSTANCE.isLeapYear(year) ? 29 : 28);
+                    break;
+                case 4:
+                case 6:
+                case 9:
+                case 11:
+                    dom = 30;
+                    break;
+            }
+            if(dayOfMonth > dom) {  // 传入的day值，不得大于计算出的最大day值
+                if(dayOfMonth == 29)
+                    throw new DateTimeException("Invalid date 'February 29' as '" + year + "' is not a leap year");
+                else
+                    throw new DateTimeException("Invalid date '" + Month.of(month).name() + " " + dayOfMonth + "'");
+            }
+        }
+        return new LocalDate(year, month, dayOfMonth);
+    }
 
+    /**
+     * 根据给定的year和month，先修正day值再构造LocalDate对象。
+     */
+    private static LocalDate resolvePreviousValid(int year, int month, int day) {
+        switch (month) {
+            case 2:
+                day = Math.min(day, IsoChronology.INSTANCE.isLeapYear(year) ? 29 : 28);
+                break;
+            case 4:
+            case 6:
+            case 9:
+            case 11:
+                day = Math.min(day, 30);
+                break;
+        }
+        return new LocalDate(year, month, day);
+    }
+
+    private LocalDate(int year, int month, int dayOfMonth) {
+        this.year = year;
+        this.month = (short) month;
+        this.day = (short) dayOfMonth;
+    }
+
+    //-----------------------------------------------------------------------
+
+    @Override  // override for Javadoc
+    public boolean isSupported(TemporalField field) {
+        return ChronoLocalDate.super.isSupported(field);    // 委托给ChronoLocalDate
+    }
+
+    @Override  // override for Javadoc
+    public boolean isSupported(TemporalUnit unit) {
+        return ChronoLocalDate.super.isSupported(unit); // 委托给ChronoLocalDate
+    }
+
+    //-----------------------------------------------------------------------
+
+    /**
+     * TemporalField -> ValueRange
+     */
+    @Override
+    public ValueRange range(TemporalField field) {
+        if(field instanceof ChronoField chronoField) {
+            if(chronoField.isDateBased()) {
+                switch(chronoField) {
+                    case DAY_OF_MONTH: return ValueRange.of(1, lengthOfMonth());
+                    case DAY_OF_YEAR: return ValueRange.of(1, lengthOfYear());
+                    case ALIGNED_WEEK_OF_MONTH: return ValueRange.of(1, getMonth() == Month.FEBRUARY && isLeapYear() == false ? 4 : 5);
+                    case YEAR_OF_ERA:
+                        return (getYear() <= 0 ? ValueRange.of(1, Year.MAX_VALUE + 1) : ValueRange.of(1, Year.MAX_VALUE));
+                }
+                return field.range();
+            }
+            throw new UnsupportedTemporalTypeException("Unsupported field: " + field);
+        }
+        return field.rangeRefinedBy(this);
+    }
+
+    /**
+     * 获取该日期指定字段的值，并以int类型返回。
+     *
+     * 此方法查询该日期指定字段的值。返回的值始终在该字段的有效值范围内。如果因字段不被支持或其他原因无法返回值，则会抛出异常。
+     * 如果该字段是ChronoField，则查询在此处实现。受支持的字段将基于当前日期返回有效值，
+     * 但EPOCH_DAY和PROLEPTIC_MONTH除外，因其数值过大无法容纳于int类型中，因此会抛出UnsupportedTemporalTypeException。
+     * 所有其他 ChronoField 实例都会抛出 UnsupportedTemporalTypeException。
+     *
+     * 如果字段不是ChronoField，则通过调用TemporalField.getFrom(TemporalAccessor)并将此方法作为参数传递来获取该方法的结果。
+     * 能否获取该值以及该值代表什么，由字段本身决定。
+     */
+    @Override
+    public int get(TemporalField field) {
+        if(field instanceof ChronoField)
+            return get0(field);
+        return ChronoLocalDate.super.get(field);
+    }
+
+    @Override
+    public long getLong(TemporalField field) {
+        if(field instanceof ChronoField) {
+            if(field == EPOCH_DAY)
+                return toEpochDay();
+            if(field == PROLEPTIC_MONTH)
+                return getProlepticMonth();
+            return get0(field);
+        }
+        return field.getFrom(this);
+    }
+
+    private int get0(TemporalField field) {
+        switch((ChronoField) field) {
+            case DAY_OF_WEEK: return getDayOfWeek().getValue();
+            case ALIGNED_DAY_OF_WEEK_IN_MONTH: return ((day - 1) % 7) + 1;
+            case ALIGNED_DAY_OF_WEEK_IN_YEAR: return ((getDayOfYear() - 1) % 7) + 1;
+            case DAY_OF_MONTH: return day;
+            case DAY_OF_YEAR: return getDayOfYear();
+            case EPOCH_DAY: throw new UnsupportedTemporalTypeException("Invalid field 'EpochDay' for get() method, use getLong() instead");
+            case ALIGNED_WEEK_OF_MONTH: return ((day - 1) / 7) + 1;
+            case ALIGNED_WEEK_OF_YEAR: return ((getDayOfYear() - 1) / 7) + 1;
+            case MONTH_OF_YEAR: return month;
+            case PROLEPTIC_MONTH: throw new UnsupportedTemporalTypeException("Invalid field 'ProlepticMonth' for get() method, use getLong() instead");
+            case YEAR_OF_ERA: return (year >= 1 ? year : 1 - year);
+            case YEAR: return year;
+            case ERA: return (year >= 1 ? 1 : 0);
+        }
+        throw new UnsupportedTemporalTypeException("Unsupported field: " + field);
+    }
+
+    private long getProlepticMonth() {
+        return (year * 12L + month - 1);
+    }
+
+    //-----------------------------------------------------------------------
+
+    @Override
+    public IsoChronology getChronology() {
+        return IsoChronology.INSTANCE;
+    }
+
+    @Override // override for Javadoc
+    public IsoEra getEra() {
+        return (getYear() >= 1 ? IsoEra.CE : IsoEra.BCE);
+    }
+
+    public int getYear() {
+        return year;
+    }
+
+    public int getMonthValue() {
+        return month;
     }
 }
