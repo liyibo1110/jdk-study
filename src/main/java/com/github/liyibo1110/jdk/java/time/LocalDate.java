@@ -10,16 +10,16 @@ import java.time.Clock;
 import java.time.DateTimeException;
 import java.time.DayOfWeek;
 import java.time.Instant;
-import java.time.LocalDateTime;
+import LocalDateTime;
 import java.time.LocalTime;
 import java.time.Month;
-import java.time.OffsetDateTime;
+import OffsetDateTime;
 import java.time.OffsetTime;
 import java.time.Period;
 import java.time.Ser;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
+import ZonedDateTime;
 import java.time.chrono.ChronoLocalDate;
 import java.time.chrono.IsoChronology;
 import java.time.chrono.IsoEra;
@@ -68,10 +68,13 @@ public final class LocalDate implements Temporal, TemporalAdjuster, ChronoLocalD
     /** 从公元元年到1970年的天数，从公元元年到2000年共有五个400年周期，从1970年到2000年共有7个闰年 */
     static final long DAYS_0000_TO_1970 = (DAYS_PER_CYCLE * 5L) - (30L * 365L + 7L);
 
+    /** 主要字段1：存储了对应的年数部分 */
     private final int year;
 
+    /** 主要字段2：存储了对应的月数部分 */
     private final short month;
 
+    /** 主要字段3：存储了对应的天数部分 */
     private final short day;
 
     //-----------------------------------------------------------------------
@@ -336,7 +339,7 @@ public final class LocalDate implements Temporal, TemporalAdjuster, ChronoLocalD
         return IsoChronology.INSTANCE;
     }
 
-    @Override // override for Javadoc
+    @Override
     public IsoEra getEra() {
         return (getYear() >= 1 ? IsoEra.CE : IsoEra.BCE);
     }
@@ -368,7 +371,7 @@ public final class LocalDate implements Temporal, TemporalAdjuster, ChronoLocalD
 
     //-----------------------------------------------------------------------
 
-    @Override // override for Javadoc and performance
+    @Override
     public boolean isLeapYear() {
         return IsoChronology.INSTANCE.isLeapYear(year);
     }
